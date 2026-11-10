@@ -10,7 +10,22 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added ``SensitiveHeaderPolicy``. An encoder constructed with a policy forces
+  the never-indexed literal representation for configured header field names or
+  for fields selected by a read-only ``(name, value)`` callback, so sensitive
+  headers no longer depend on every caller marking them individually. The
+  policy is scoped to its encoder and can only strengthen sensitivity that the
+  caller already requested.
+
 **Bugfixes**
+
+- Sensitive header fields whose name and value already match a static or
+  dynamic table entry are now encoded as never-indexed literals (with an
+  indexed name where available) instead of an indexed representation, and are
+  never inserted into the dynamic table.
+- When a sensitive header policy callback raises mid-block, the encoding run
+  no longer leaves a partially updated dynamic table or a consumed table size
+  change; no partial header block is emitted.
 
 
 4.2.0 (2026-06-22)

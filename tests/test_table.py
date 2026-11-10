@@ -141,3 +141,34 @@ class TestHeaderTable:
         tbl.maxsize = 146
         assert len(tbl.dynamic_entries) == 2
         assert tbl._current_size == 98
+
+    def test_snapshot_and_restore(self):
+        tbl = HeaderTable()
+        tbl.add(b'Name', b'Value')
+        tbl.maxsize = 128
+        snapshot = tbl.snapshot()
+
+        tbl.add(b'Other', b'Thing')
+        tbl.maxsize = 0
+        tbl.resized = False
+
+        tbl.restore(snapshot)
+
+        assert tbl.maxsize == 128
+        assert tbl.resized is True
+        assert list(tbl.dynamic_entries) == [(b'Name', b'Value')]
+        assert tbl._current_size == table_entry_size(b'Name', b'Value')
+
+    def test_restored_entries_are_independent_of_later_mutation(self):
+        tbl = HeaderTable()
+        tbl.add(b'Name', b'Value')
+        snapshot = tbl.snapshot()
+        tbl.add(b'Other', b'Thing')
+
+        tbl.restore(snapshot)
+
+        assert list(tbl.dynamic_entries) == [(b'Name', b'Value')]
+        # Mutating the restored table must not alter the captured snapshot.
+        tbl.add(b'Third', b'Entry')
+        tbl.restore(snapshot)
+        assert list(tbl.dynamic_entries) == [(b'Name', b'Value')]

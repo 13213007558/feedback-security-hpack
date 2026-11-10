@@ -1,11 +1,17 @@
-# flake8: noqa
+from __future__ import annotations
+
 from collections import deque
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .exceptions import InvalidTableIndex
 
+if TYPE_CHECKING:
+    from typing_extensions import TypeAlias  # noqa: UP035
+
 log = logging.getLogger(__name__)
+
+HeaderTableSnapshot: TypeAlias = "tuple[int, int, bool, tuple[tuple[bytes, bytes], ...]]"
 
 
 def table_entry_size(name: bytes, value: bytes) -> int:
@@ -161,6 +167,28 @@ class HeaderTable:
             self.dynamic_entries.appendleft((name, value))
             self._current_size += size
             self._shrink()
+
+    def snapshot(self) -> HeaderTableSnapshot:
+        """
+        Captures the complete mutable state of the table so it can be restored
+        later. Used to roll the table back when an encoding run fails midway.
+        """
+        return (
+            self._maxsize,
+            self._current_size,
+            self.resized,
+            tuple(self.dynamic_entries),
+        )
+
+    def restore(self, snapshot: HeaderTableSnapshot) -> None:
+        """
+        Restores the table to a state previously captured by :meth:`snapshot`.
+        """
+        maxsize, current_size, resized, dynamic_entries = snapshot
+        self._maxsize = maxsize
+        self._current_size = current_size
+        self.resized = resized
+        self.dynamic_entries = deque(dynamic_entries)
 
     def search(self, name: bytes, value: bytes) -> Optional[tuple[int, bytes, Optional[bytes]]]:
         """

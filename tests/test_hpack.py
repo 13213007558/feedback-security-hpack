@@ -13,6 +13,7 @@ from hpack import (
     InvalidTableIndex,
     OversizedHeaderListError,
     InvalidTableSizeError,
+    SensitiveHeaderPolicy,
 )
 from hpack.hpack import _dict_to_iterable, _to_bytes
 
@@ -47,7 +48,11 @@ class TestHPACKEncoder:
         Test encoding header values
         """
         e = Encoder()
-        result = (b'\x82\x14\x88\x63\xa1\xa9' +
+        # Sensitive fields whose names match the static table are still sent
+        # as never-indexed literals with an indexed name, never as plain
+        # indexed representations: :method GET uses prefix 0x10 with name
+        # index 2, :path uses 0x14 with name index 4.
+        result = (b'\x12\x83\xc5\x83\x7f\x14\x88\x63\xa1\xa9' +
                   b'\x32\x08\x73\xd0\xc7\x10' +
                   b'\x87\x25\xa8\x49\xe9\xea' +
                   b'\x5f\x5f\x89\x41\x6a\x41' +
@@ -83,7 +88,10 @@ class TestHPACKEncoder:
         representation that forbids indexing.
         """
         e = Encoder()
-        result = (b'\x82\x14\x88\x63\xa1\xa9' +
+        # As with explicit three-tuple sensitivity, static-table name matches
+        # become never-indexed indexed-name literals rather than indexed
+        # representations.
+        result = (b'\x12\x83\xc5\x83\x7f\x14\x88\x63\xa1\xa9' +
                   b'\x32\x08\x73\xd0\xc7\x10' +
                   b'\x87\x25\xa8\x49\xe9\xea' +
                   b'\x5f\x5f\x89\x41\x6a\x41' +
@@ -856,3 +864,256 @@ class TestDictToIterable:
 
         assert expected_special == received_special
         assert expected_boring == received_boring
+
+
+class TestSensitiveHeaderPolicy:
+    """
+    Tests for the optional encoder-level policy that forces never-indexed
+    representations for selected header fields.
+    """
+
+    def test_policy_matches_field_names_with_str_and_bytes(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['authorization', b'cookie']))
+
+        out = e.encode(
+            [(':method', 'GET'), ('authorization', 'Bearer x'), (b'cookie', b'a=b')],
+            huffman=False,
+        )
+
+        # :method GET is a static perfect match and stays indexed.
+        assert out.startswith(b'\x82')
+        # authorization is static-table index 23, sent never-indexed with an
+        # indexed name (varint 23 over a 4-bit prefix).
+        assert b'\x1f\x08\x08Bearer x' in out
+        # cookie is static-table index 32, likewise never-indexed by name.
+        assert b'\x1f\x11\x03a=b' in out
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_policy_callback_receives_read_only_bytes_pair(self):
+        seen = []
+
+        def policy(pair):
+            name, value = pair
+            seen.append((type(pair), type(name), type(value)))
+            return value == b'secret'
+
+        e = Encoder(SensitiveHeaderPolicy(callback=policy))
+        out = e.encode([('x-token', 'secret'), ('x-normal', 'ok')], huffman=False)
+
+        assert seen == [(tuple, bytes, bytes), (tuple, bytes, bytes)]
+        assert out == b'\x10\x07x-token\x06secret@\x08x-normal\x02ok'
+        assert list(e.header_table.dynamic_entries) == [(b'x-normal', b'ok')]
+
+    def test_policy_names_and_callback_combine(self):
+        policy = SensitiveHeaderPolicy(
+            sensitive_names=['by-name'],
+            callback=lambda pair: pair[1] == b'by-value',
+        )
+        e = Encoder(policy)
+
+        out = e.encode(
+            [('by-name', 'a'), ('other', 'by-value'), ('plain', 'p')],
+            huffman=False,
+        )
+
+        assert out == (
+            b'\x10\x07by-name\x01a'
+            b'\x10\x05other\x08by-value'
+            b'@\x05plain\x01p'
+        )
+        assert list(e.header_table.dynamic_entries) == [(b'plain', b'p')]
+
+    def test_policy_cannot_downgrade_three_tuple_sensitive(self):
+        e = Encoder(SensitiveHeaderPolicy(callback=lambda pair: False))
+
+        out = e.encode([('a', 'b', True), ('c', 'd', False)], huffman=False)
+
+        assert out == b'\x10\x01a\x01b@\x01c\x01d'
+        assert list(e.header_table.dynamic_entries) == [(b'c', b'd')]
+
+    def test_policy_cannot_downgrade_never_indexed_header_tuple(self):
+        e = Encoder(SensitiveHeaderPolicy(callback=lambda pair: False))
+
+        out = e.encode([NeverIndexedHeaderTuple('a', 'b')], huffman=False)
+
+        assert out == b'\x10\x01a\x01b'
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_policy_applies_to_dict_headers(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['password']))
+
+        out = e.encode({':method': 'GET', 'password': 'hunter2'}, huffman=False)
+
+        assert out == b'\x82\x10\x08password\x07hunter2'
+        assert Decoder().decode(out) == [(':method', 'GET'), ('password', 'hunter2')]
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_sensitive_perfect_match_in_dynamic_table_is_not_indexed(self):
+        e = Encoder()
+        d = Decoder()
+        first = e.encode([('token', 'abc')], huffman=False)
+        d.decode(first)
+        assert list(e.header_table.dynamic_entries) == [(b'token', b'abc')]
+
+        # The same name/value is already in the dynamic table, but once the
+        # policy marks it sensitive the perfect match must not become an
+        # indexed representation.
+        e.sensitive_header_policy = SensitiveHeaderPolicy(sensitive_names=['token'])
+        out = e.encode([('token', 'abc')], huffman=False)
+
+        # Dynamic-table index 62 referenced with the never-indexed, indexed
+        # name literal form.
+        assert out == b'\x1f/\x03abc'
+        assert out[0] & 0xF0 == 0x10
+        assert list(e.header_table.dynamic_entries) == [(b'token', b'abc')]
+        assert d.decode(out) == [('token', 'abc')]
+        # The decoder must not have added a second copy of the secret.
+        assert list(d.header_table.dynamic_entries) == [(b'token', b'abc')]
+
+    def test_sensitive_perfect_match_in_static_table_is_not_indexed(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=[':method']))
+
+        out = e.encode([(':method', 'GET')], huffman=False)
+
+        # Static index 2 under the never-indexed prefix, value sent literally.
+        assert out == b'\x12\x03GET'
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_sensitive_name_index_allowed_without_table_insert(self):
+        # A never-indexed field may still reference a name from the static
+        # table while its value stays literal and out of the dynamic table.
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['authorization']))
+
+        out = e.encode([('authorization', 'Bearer x')], huffman=True)
+
+        assert out[0] == 0x1F and out[1] == 0x08
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_input_order_and_duplicates_are_preserved(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['k']))
+
+        out = e.encode([('k', 'v1'), ('z', 'z'), ('k', 'v2')], huffman=False)
+
+        assert out == b'\x10\x01k\x02v1@\x01z\x01z\x10\x01k\x02v2'
+        assert list(e.header_table.dynamic_entries) == [(b'z', b'z')]
+
+    def test_no_case_normalization_in_matching(self):
+        # The compression layer must not fold protocol-layer case: only an
+        # exact byte match counts as a configured sensitive name.
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['authorization']))
+
+        out = e.encode([('Authorization', 'Bearer x')], huffman=False)
+
+        assert out.startswith(b'@')
+        assert list(e.header_table.dynamic_entries) == [(b'Authorization', b'Bearer x')]
+
+    def test_policy_is_scoped_to_its_encoder(self):
+        secured = Encoder(SensitiveHeaderPolicy(sensitive_names=['authorization']))
+        plain = Encoder()
+
+        secured_out = secured.encode([('authorization', 'x')], huffman=False)
+        plain_out = plain.encode([('authorization', 'x')], huffman=False)
+
+        assert secured_out[0] & 0xF0 == 0x10
+        assert plain_out[0] & 0xC0 == 0x40
+        assert list(secured.header_table.dynamic_entries) == []
+        assert list(plain.header_table.dynamic_entries) == [(b'authorization', b'x')]
+
+    def test_callback_exception_aborts_without_partial_block_or_table_state(self):
+        class PolicyFailure(Exception):
+            pass
+
+        def policy(pair):
+            if pair[0] == b'boom':
+                raise PolicyFailure
+            return False
+
+        e = Encoder(SensitiveHeaderPolicy(callback=policy))
+        e.encode([('normal', '1')], huffman=False)
+        assert list(e.header_table.dynamic_entries) == [(b'normal', b'1')]
+
+        with pytest.raises(PolicyFailure):
+            e.encode([('a', 'b'), ('boom', 'x'), ('c', 'd')], huffman=False)
+
+        # Entries added by the headers processed before the failure are rolled
+        # back; no secret value lingers in the table.
+        assert list(e.header_table.dynamic_entries) == [(b'normal', b'1')]
+
+    def test_callback_exception_restores_pending_table_size_change(self):
+        class PolicyFailure(Exception):
+            pass
+
+        def policy(pair):
+            raise PolicyFailure
+
+        e = Encoder(SensitiveHeaderPolicy(callback=policy))
+        e.header_table_size = 100
+        assert e.table_size_changes == [100]
+
+        with pytest.raises(PolicyFailure):
+            e.encode([('boom', 'x')], huffman=False)
+
+        assert e.header_table.resized is True
+        assert e.table_size_changes == [100]
+
+    def test_policy_covers_multiple_subsequent_requests(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['authorization']))
+        d = Decoder()
+
+        for request in range(3):
+            out = e.encode(
+                [
+                    (':method', 'GET'),
+                    ('authorization', 'tok'),
+                    ('x', str(request)),
+                ],
+                huffman=False,
+            )
+            decoded = d.decode(out)
+
+            assert decoded == [
+                (':method', 'GET'),
+                ('authorization', 'tok'),
+                ('x', str(request)),
+            ]
+            assert not any(
+                name == b'authorization' for name, _ in e.header_table.dynamic_entries
+            )
+            assert not any(
+                name == b'authorization' for name, _ in d.header_table.dynamic_entries
+            )
+
+        # Only the non-sensitive x entries ever enter either dynamic table.
+        assert list(e.header_table.dynamic_entries) == [
+            (b'x', b'2'), (b'x', b'1'), (b'x', b'0'),
+        ]
+
+    def test_encoder_without_policy_keeps_legacy_indexed_behavior(self):
+        e = Encoder()
+        e.encode([('token', 'abc')], huffman=False)
+
+        # A perfect dynamic-table match still uses the indexed representation.
+        assert e.encode([('token', 'abc')], huffman=False) == b'\xbe'
+
+    def test_policy_attribute_can_be_replaced_or_cleared(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=['secret']))
+
+        assert e.encode([('secret', 'v')], huffman=False).startswith(b'\x10')
+        assert list(e.header_table.dynamic_entries) == []
+
+        e.sensitive_header_policy = None
+        out = e.encode([('secret', 'v')], huffman=False)
+
+        # Without a policy the field is indexable again and enters the table.
+        assert out[0] & 0xC0 == 0x40
+        assert list(e.header_table.dynamic_entries) == [(b'secret', b'v')]
+
+    def test_empty_policy_marks_nothing_and_accepts_truthy_callback_results(self):
+        e = Encoder(SensitiveHeaderPolicy(sensitive_names=[]))
+        assert e.encode([('a', 'b')], huffman=False) == b'@\x01a\x01b'
+
+        e2 = Encoder(
+            SensitiveHeaderPolicy(callback=lambda pair: "yes" if pair[0] == b't' else 0),
+        )
+        out = e2.encode([('t', '1'), ('u', '2')], huffman=False)
+        assert out == b'\x10\x01t\x011@\x01u\x012'

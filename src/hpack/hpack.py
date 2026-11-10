@@ -11,10 +11,10 @@ from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .huffman_table import decode_huffman
 from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
-from .table import HeaderTable, table_entry_size
+from .table import HeaderTable, HeaderTableSnapshot, table_entry_size
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable  # pragma: no cover
+    from collections.abc import Callable, Iterable  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
@@ -159,18 +159,81 @@ def _to_bytes(value: bytes | str | Any) -> bytes:
     return value.encode("utf-8")  # type: ignore
 
 
+class SensitiveHeaderPolicy:
+    """
+    An optional policy that decides, on behalf of an :class:`Encoder`, which
+    header fields must always be represented with the never-indexed literal
+    representation (RFC 7541 section 6.2.3).
+
+    A policy lets a backend enforce sensitive-field handling in one place
+    instead of relying on every caller remembering to mark individual headers
+    as sensitive. It is attached to a single encoder and therefore only
+    affects header blocks produced by that encoder.
+
+    Two configuration mechanisms are provided, either or both of which may be
+    used:
+
+    :param sensitive_names: An iterable of header field names. Any field whose
+        name matches one of these (as raw bytes, no case normalization) is
+        treated as sensitive.
+    :param callback: A callable invoked once per header field with the
+        read-only, already-bytes ``(name, value)`` pair. A truthy return value
+        marks the field as sensitive. The pair must be treated as read-only;
+        the encoder does not mutate it.
+
+    A field that the caller already marked as sensitive (a three-tuple with a
+    truthy third entry, or a
+    :class:`~hpack.struct.NeverIndexedHeaderTuple`) is always sensitive: the
+    policy can only add fields to the sensitive set, never remove them.
+
+    Sensitive fields are never added to the dynamic table, and a perfect match
+    found in the static or dynamic table is still emitted as a never-indexed
+    literal (using an indexed name where one exists), never as an indexed
+    representation.
+    """
+
+    def __init__(
+        self,
+        sensitive_names: Iterable[bytes | str] | None = None,
+        callback: Callable[[tuple[bytes, bytes]], object] | None = None,
+    ) -> None:
+        self._sensitive_names = frozenset(
+            _to_bytes(name) for name in sensitive_names
+        ) if sensitive_names is not None else frozenset()
+        self._callback = callback
+
+    def is_sensitive(self, name: bytes, value: bytes) -> bool:
+        """
+        Returns whether the header field described by ``name`` and ``value``
+        must be never-indexed according to this policy.
+
+        Name matching is an exact byte comparison; field names and values are
+        passed through unchanged, with no protocol-layer case normalization.
+        Any exception raised by the callback propagates to the caller.
+        """
+        if name in self._sensitive_names:
+            return True
+        if self._callback is not None:
+            return bool(self._callback((name, value)))
+        return False
+
+
 class Encoder:
     """
     An HPACK encoder object. This object takes HTTP headers and emits encoded
     HTTP/2 header blocks.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sensitive_header_policy: SensitiveHeaderPolicy | None = None) -> None:
         self.header_table = HeaderTable()
         self.huffman_coder = HuffmanEncoder(
             REQUEST_CODES, REQUEST_CODES_LENGTH,
         )
         self.table_size_changes: list[int] = []
+        #: Optional policy that forces never-indexed encoding for selected
+        #: header fields. Scoped to this encoder alone; other encoder
+        #: instances are unaffected.
+        self.sensitive_header_policy = sensitive_header_policy
 
     @property
     def header_table_size(self) -> int:
@@ -234,6 +297,13 @@ class Encoder:
                         recommended that this be left enabled.
 
         :returns: A bytestring containing the HPACK-encoded header block.
+
+        Fields flagged as sensitive by this encoder's
+        :class:`SensitiveHeaderPolicy` are encoded exactly like fields the
+        caller marks sensitive: they always use the never-indexed literal
+        representation and are never added to the dynamic table. If the policy
+        callback raises, no partial header block is returned and the dynamic
+        table is rolled back to the state it had before this call.
         """
         # Transforming the headers into a header block is a procedure that can
         # be modeled as a chain or pipe. First, the headers are encoded. This
@@ -241,7 +311,18 @@ class Encoder:
         # are already in the header table we can represent them using the
         # indexed representation: the same is true if they are in the static
         # table. Otherwise, a literal representation will be used.
-        header_block = []
+        policy = self.sensitive_header_policy
+        header_block: list[bytes] = []
+
+        # A policy callback can fail midway through the block. When that
+        # happens we must not leave a dynamic table containing entries added
+        # during the failed run, so snapshot everything the encoding process
+        # can mutate and roll it back on any exception.
+        table_snapshot: HeaderTableSnapshot | None = None
+        size_changes_snapshot: list[int] | None = None
+        if policy is not None:
+            table_snapshot = self.header_table.snapshot()
+            size_changes_snapshot = list(self.table_size_changes)
 
         # Before we begin, if the header table size has been changed we need
         # to signal all changes since last emission appropriately.
@@ -276,17 +357,28 @@ class Encoder:
             """
             hpack_headers = iter(headers)  # type: ignore
 
-        # Add each header to the header block
-        for header in hpack_headers:
-            sensitive = False
-            if isinstance(header, HeaderTuple):
-                # HeaderTuple implies it's a 2-tuple with the sensitive information stored as instance attribute
-                sensitive = not header.indexable
-            elif len(header) > 2:
-                sensitive = header[2]
+        try:
+            # Add each header to the header block
+            for header in hpack_headers:
+                sensitive = False
+                if isinstance(header, HeaderTuple):
+                    # HeaderTuple implies it's a 2-tuple with the sensitive information stored as instance attribute
+                    sensitive = not header.indexable
+                elif len(header) > 2:
+                    sensitive = header[2]
 
-            new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
-            header_block.append(self.add(new_header, sensitive, huffman))
+                new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
+                if policy is not None:
+                    # The policy may only strengthen sensitivity, never weaken
+                    # a field the caller already marked as sensitive.
+                    sensitive = sensitive or policy.is_sensitive(*new_header)
+
+                header_block.append(self.add(new_header, sensitive, huffman))
+        except BaseException:  # noqa: BLE001 - roll back on any failure, then re-raise
+            if policy is not None and table_snapshot is not None and size_changes_snapshot is not None:
+                self.header_table.restore(table_snapshot)
+                self.table_size_changes = size_changes_snapshot
+            raise
 
         encoded = b"".join(header_block)
 
@@ -333,7 +425,7 @@ class Encoder:
         # can use the indexed literal.
         index, name, perfect = match
 
-        if perfect is not None:
+        if perfect is not None and not sensitive:
             # Indexed representation.
             encoded = self._encode_indexed(index)
         else:
@@ -342,6 +434,11 @@ class Encoder:
             # filter out headers which are known to be ineffective for
             # indexing since they just take space in the table and
             # pushed out other valuable headers.
+            #
+            # A perfect match on a sensitive header must never be emitted
+            # as an indexed representation: re-use the matched name index
+            # but send the value literally with the never-indexed prefix,
+            # and do not touch the dynamic table.
             encoded = self._encode_indexed_literal(
                 index, value, indexbit, huffman,
             )
