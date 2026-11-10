@@ -234,7 +234,38 @@ class Encoder:
                         recommended that this be left enabled.
 
         :returns: A bytestring containing the HPACK-encoded header block.
+
+        :raises Exception: If encoding fails, the call is atomic: the dynamic
+                           header table, the configured table size and any
+                           pending table size updates are rolled back to the
+                           state they were in before this call, so no bytes
+                           describing the failed block were ever emitted and
+                           the encoder remains usable for a retry. Exceptions
+                           raised while pulling from a generator or while
+                           converting its values, as well as invalid input,
+                           all trigger this rollback.
         """
+        # Encoding mutates the compression context as it goes (dynamic table
+        # inserts/evictions, table size updates, and the pending update list).
+        # If anything raises before the full block is produced, none of those
+        # bytes have been emitted, so roll every mutation back to keep this
+        # object consistent with a decoder that never received the block.
+        table_state = self.header_table.snapshot()
+        table_size_changes = self.table_size_changes.copy()
+        try:
+            return self._encode(headers, huffman)
+        except Exception:
+            self.header_table.restore(table_state)
+            self.table_size_changes = table_size_changes
+            raise
+
+    def _encode(self,
+                headers: Iterable[\
+                    HeaderTuple | \
+                    tuple[bytes | str, bytes | str] | \
+                    tuple[bytes | str, bytes | str, bool | None]] | \
+                    dict[bytes | str, bytes | str],
+                huffman: bool = True) -> bytes:
         # Transforming the headers into a header block is a procedure that can
         # be modeled as a chain or pipe. First, the headers are encoded. This
         # encoding can be done a number of ways. If the header name-value pair

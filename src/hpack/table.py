@@ -162,6 +162,26 @@ class HeaderTable:
             self._current_size += size
             self._shrink()
 
+    def snapshot(self) -> tuple[int, int, bool, deque[tuple[bytes, bytes]]]:
+        """
+        Captures the table's mutable state so it can be restored later.
+
+        The dynamic entries are copied: entries themselves are immutable
+        byte-string tuples, so a shallow copy of the deque is enough.
+        """
+        return (
+            self._maxsize,
+            self._current_size,
+            self.resized,
+            deque(self.dynamic_entries),
+        )
+
+    def restore(self, state: tuple[int, int, bool, deque[tuple[bytes, bytes]]]) -> None:
+        """
+        Restores state previously captured with :meth:`snapshot`.
+        """
+        self._maxsize, self._current_size, self.resized, self.dynamic_entries = state
+
     def search(self, name: bytes, value: bytes) -> Optional[tuple[int, bytes, Optional[bytes]]]:
         """
         Searches the table for the entry specified by name
