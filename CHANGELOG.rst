@@ -10,6 +10,8 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added an incremental decoding interface to ``Decoder``: ``begin_header_block``, ``feed_data``, ``end_header_block`` and ``abort_header_block`` allow decoding a header block as its fragments arrive. ``decode`` is now implemented on top of this interface, sharing all validation logic.
+
 **Bugfixes**
 
 
